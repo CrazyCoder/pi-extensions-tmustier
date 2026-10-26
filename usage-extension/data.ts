@@ -149,6 +149,7 @@ export interface PeriodBounds {
 	todayMs: number;
 	weekStartMs: number;
 	lastWeekStartMs: number;
+	thisMonthStartMs: number;
 	last30DaysStartMs: number;
 	nowMs: number;
 }
@@ -157,6 +158,7 @@ export interface UsageData {
 	today: TimeFilteredStats;
 	thisWeek: TimeFilteredStats;
 	lastWeek: TimeFilteredStats;
+	thisMonth: TimeFilteredStats;
 	last30Days: TimeFilteredStats;
 	allTime: TimeFilteredStats;
 	/** Deduped usage bucketed by hour start (ms) → series key → metrics. */
@@ -164,9 +166,9 @@ export interface UsageData {
 	bounds: PeriodBounds;
 }
 
-export type TabName = "today" | "thisWeek" | "lastWeek" | "last30Days" | "allTime";
+export type TabName = "today" | "thisWeek" | "lastWeek" | "thisMonth" | "last30Days" | "allTime";
 
-export const TAB_ORDER: TabName[] = ["today", "thisWeek", "lastWeek", "last30Days", "allTime"];
+export const TAB_ORDER: TabName[] = ["today", "thisWeek", "lastWeek", "thisMonth", "last30Days", "allTime"];
 
 export type UsageSource = "assistant" | "auxiliary";
 
@@ -194,12 +196,8 @@ export interface SessionMessage extends UsageAmount {
 	/** Session entry id used to dedupe copied auxiliary entries; empty for assistant messages. */
 	sourceId: string;
 	timestamp: number;
-	/**
-	 * True when a compaction entry occurred between the previous assistant
-	 * message and this one. Compaction legitimately changes the request prefix,
-	 * so such messages are excluded from prefix-change cache-miss accounting.
-	 */
-	afterCompaction: boolean;
+	/** The request followed a compaction or context edit that intentionally changed its prefix. */
+	afterContextChange: boolean;
 }
 
 export interface ChildToolUsage {
@@ -300,6 +298,8 @@ const PATTERN_THINKING_COMPACT = Buffer.from('"type":"thinking_level_change"');
 const PATTERN_THINKING_SPACED = Buffer.from('"type": "thinking_level_change"');
 const PATTERN_COMPACTION_COMPACT = Buffer.from('"type":"compaction"');
 const PATTERN_COMPACTION_SPACED = Buffer.from('"type": "compaction"');
+const PATTERN_CONTEXT_EDIT_COMPACT = Buffer.from('"type":"context_edit"');
+const PATTERN_CONTEXT_EDIT_SPACED = Buffer.from('"type": "context_edit"');
 const PATTERN_BRANCH_SUMMARY_COMPACT = Buffer.from('"type":"branch_summary"');
 const PATTERN_BRANCH_SUMMARY_SPACED = Buffer.from('"type": "branch_summary"');
 // pi-subagents versions predating Pi 0.81 persisted child usage in details but
@@ -357,7 +357,7 @@ function auxiliaryMessage(usage: UsageAmount, timestamp: number, sourceId: strin
 		sourceId,
 		...usage,
 		timestamp,
-		afterCompaction: false,
+		afterContextChange: false,
 	};
 }
 
@@ -642,10 +642,12 @@ function lineMightBeRelevant(line: Buffer): boolean {
 		head.includes(PATTERN_SESSION_COMPACT) ||
 		head.includes(PATTERN_THINKING_COMPACT) ||
 		head.includes(PATTERN_COMPACTION_COMPACT) ||
+		head.includes(PATTERN_CONTEXT_EDIT_COMPACT) ||
 		head.includes(PATTERN_BRANCH_SUMMARY_COMPACT) ||
 		head.includes(PATTERN_SESSION_SPACED) ||
 		head.includes(PATTERN_THINKING_SPACED) ||
 		head.includes(PATTERN_COMPACTION_SPACED) ||
+		head.includes(PATTERN_CONTEXT_EDIT_SPACED) ||
 		head.includes(PATTERN_BRANCH_SUMMARY_SPACED)
 	);
 }
@@ -665,7 +667,7 @@ export async function parseSessionBuffer(buffer: Buffer, signal?: AbortSignal): 
 	// message of a session. Replaying them in append order attributes each message
 	// to the level active when it was produced.
 	let thinkingLevel = "";
-	let compactionPending = false;
+	let contextChangePending = false;
 
 	let start = 0;
 	let lineNumber = 0;
@@ -700,7 +702,9 @@ export async function parseSessionBuffer(buffer: Buffer, signal?: AbortSignal): 
 				} else if (entry.type === "compaction") {
 					const usage = parseUsageAmount(entry.usage);
 					if (usage) messages.push(auxiliaryMessage(usage, parsedTimestamp(undefined, entry.timestamp), typeof entry.id === "string" ? entry.id : ""));
-					compactionPending = true;
+					contextChangePending = true;
+				} else if (entry.type === "context_edit") {
+					contextChangePending = true;
 				} else if (entry.type === "branch_summary") {
 					const usage = parseUsageAmount(entry.usage);
 					if (usage) messages.push(auxiliaryMessage(usage, parsedTimestamp(undefined, entry.timestamp), typeof entry.id === "string" ? entry.id : ""));
@@ -721,9 +725,9 @@ export async function parseSessionBuffer(buffer: Buffer, signal?: AbortSignal): 
 							cacheWrite: msg.usage.cacheWrite || 0,
 							reasoning: msg.usage.reasoning || 0,
 							timestamp: msg.timestamp || (Number.isNaN(fallbackTs) ? 0 : fallbackTs),
-							afterCompaction: compactionPending,
+							afterContextChange: contextChangePending,
 						});
-						compactionPending = false;
+						contextChangePending = false;
 					}
 				} else if (entry.type === "message" && entry.message?.role === "toolResult") {
 					const msg = entry.message;
@@ -745,7 +749,7 @@ export async function parseSessionBuffer(buffer: Buffer, signal?: AbortSignal): 
 // On-disk cache
 // =============================================================================
 
-const CACHE_VERSION = 5;
+const CACHE_VERSION = 6;
 
 type CachedMessageTuple = [
 	providerIdx: number,
@@ -758,7 +762,7 @@ type CachedMessageTuple = [
 	timestamp: number,
 	thinkingLevelIdx: number,
 	reasoning: number,
-	afterCompaction: 0 | 1,
+	afterContextChange: 0 | 1,
 	auxiliary: 0 | 1,
 	sourceIdIdx: number,
 ];
@@ -860,7 +864,7 @@ export async function loadUsageCache(cachePath: string): Promise<Map<string, Cac
 				cacheWrite: Number(tuple[6]) || 0,
 				timestamp: Number(tuple[7]) || 0,
 				reasoning: Number(tuple[9]) || 0,
-				afterCompaction: tuple[10] === 1,
+				afterContextChange: tuple[10] === 1,
 			});
 		}
 		if (!valid) continue;
@@ -959,7 +963,7 @@ export async function saveUsageCache(cachePath: string, states: Map<string, Cach
 				m.timestamp,
 				intern(m.thinkingLevel),
 				m.reasoning,
-				m.afterCompaction ? 1 : 0,
+				m.afterContextChange ? 1 : 0,
 				m.source === "auxiliary" ? 1 : 0,
 				intern(m.source === "auxiliary" ? m.sourceId : ""),
 			]),
@@ -1060,6 +1064,7 @@ function emptyUsageData(bounds: PeriodBounds): UsageData {
 		today: emptyTimeFilteredStats(),
 		thisWeek: emptyTimeFilteredStats(),
 		lastWeek: emptyTimeFilteredStats(),
+		thisMonth: emptyTimeFilteredStats(),
 		last30Days: emptyTimeFilteredStats(),
 		allTime: emptyTimeFilteredStats(),
 		hourly: new Map(),
@@ -1113,6 +1118,7 @@ function getPeriodsForTimestamp(
 	todayMs: number,
 	weekStartMs: number,
 	lastWeekStartMs: number,
+	thisMonthStartMs: number,
 	last30DaysStartMs: number
 ): TabName[] {
 	const periods: TabName[] = ["allTime"];
@@ -1122,6 +1128,7 @@ function getPeriodsForTimestamp(
 	} else if (timestamp >= lastWeekStartMs) {
 		periods.push("lastWeek");
 	}
+	if (timestamp >= thisMonthStartMs) periods.push("thisMonth");
 	if (timestamp >= last30DaysStartMs) periods.push("last30Days");
 	return periods;
 }
@@ -1138,11 +1145,12 @@ function addMessagesToUsageData(
 	todayMs: number,
 	weekStartMs: number,
 	lastWeekStartMs: number,
+	thisMonthStartMs: number,
 	last30DaysStartMs: number,
 	rawByPeriod: Record<TabName, PeriodRawData>,
 	costByDayIdx: Map<number, number>
 ): void {
-	const sessionContributed = { today: false, thisWeek: false, lastWeek: false, last30Days: false, allTime: false };
+	const sessionContributed = { today: false, thisWeek: false, lastWeek: false, thisMonth: false, last30Days: false, allTime: false };
 
 	for (let mi = 0; mi < messages.length; mi++) {
 		const msg = messages[mi]!;
@@ -1159,7 +1167,14 @@ function addMessagesToUsageData(
 
 		addToHourlyBuckets(data.hourly, msg);
 
-		const periods = getPeriodsForTimestamp(msg.timestamp, todayMs, weekStartMs, lastWeekStartMs, last30DaysStartMs);
+		const periods = getPeriodsForTimestamp(
+			msg.timestamp,
+			todayMs,
+			weekStartMs,
+			lastWeekStartMs,
+			thisMonthStartMs,
+			last30DaysStartMs
+		);
 		const tokens = {
 			// Count fresh tokens processed this turn.
 			// Include cacheWrite because those prompt tokens were newly written and billed.
@@ -1220,7 +1235,7 @@ function addMessagesToUsageData(
 			}
 			if (mm.isSessionStart) raw.upfrontCost += msg.cost;
 			if (
-				!msg.afterCompaction &&
+				!msg.afterContextChange &&
 				mm.prevCtx >= MISS_MIN_PREV_CONTEXT &&
 				msg.cacheRead < Math.min(MISS_MAX_CACHE_READ, 0.3 * mm.prevCtx)
 			) {
@@ -1238,6 +1253,7 @@ function addMessagesToUsageData(
 	if (sessionContributed.today) data.today.totals.sessions++;
 	if (sessionContributed.thisWeek) data.thisWeek.totals.sessions++;
 	if (sessionContributed.lastWeek) data.lastWeek.totals.sessions++;
+	if (sessionContributed.thisMonth) data.thisMonth.totals.sessions++;
 	if (sessionContributed.last30Days) data.last30Days.totals.sessions++;
 	if (sessionContributed.allTime) data.allTime.totals.sessions++;
 }
@@ -1395,6 +1411,12 @@ export async function collectUsageData(options: CollectUsageOptions = {}): Promi
 	startOfLastWeek.setDate(startOfLastWeek.getDate() - 7);
 	const lastWeekStartMs = startOfLastWeek.getTime();
 
+	// Calendar month to date, from local midnight on the first.
+	const startOfThisMonth = new Date(now);
+	startOfThisMonth.setDate(1);
+	startOfThisMonth.setHours(0, 0, 0, 0);
+	const thisMonthStartMs = startOfThisMonth.getTime();
+
 	// Rolling 30-day window: the last 30 calendar days including today,
 	// i.e. from midnight 29 days before today. setDate handles DST correctly.
 	const startOfLast30Days = new Date(startOfToday);
@@ -1524,11 +1546,19 @@ export async function collectUsageData(options: CollectUsageOptions = {}): Promi
 	}
 
 	// 6. Aggregate in sorted path order with cross-file dedupe.
-	const data = emptyUsageData({ todayMs, weekStartMs, lastWeekStartMs, last30DaysStartMs, nowMs: now.getTime() });
+	const data = emptyUsageData({
+		todayMs,
+		weekStartMs,
+		lastWeekStartMs,
+		thisMonthStartMs,
+		last30DaysStartMs,
+		nowMs: now.getTime(),
+	});
 	const rawByPeriod: Record<TabName, PeriodRawData> = {
 		today: emptyPeriodRawData(),
 		thisWeek: emptyPeriodRawData(),
 		lastWeek: emptyPeriodRawData(),
+		thisMonth: emptyPeriodRawData(),
 		last30Days: emptyPeriodRawData(),
 		allTime: emptyPeriodRawData(),
 	};
@@ -1595,6 +1625,7 @@ export async function collectUsageData(options: CollectUsageOptions = {}): Promi
 			todayMs,
 			weekStartMs,
 			lastWeekStartMs,
+			thisMonthStartMs,
 			last30DaysStartMs,
 			rawByPeriod,
 			costByDayIdx

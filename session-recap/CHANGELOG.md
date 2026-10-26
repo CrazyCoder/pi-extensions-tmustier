@@ -6,6 +6,12 @@
 - Draw a recap only for a cleanly stopped response. `complete`/`completeSimple` resolve rather than throw when a stream fails, is aborted, or stops at the token cap, and the message they return holds only the text that arrived before the cut. Rendering that fragment produced recaps of a single dangling word. A stream failure is now reported with the provider's error message instead of passing silently.
 - Report a recap failure through `ctx.ui.notify` instead of `console.error`. Pi installs no console interception, so an extension writing there put a multi-line stack straight onto the terminal in the middle of a frame, overwriting the status bar it landed on.
 
+## [0.5.1] - 2026-09-22
+
+### Changed
+- Build recaps from Pi 0.87's projected session context so context edits, omissions, and replacements are reflected in both recent activity and initial task framing.
+- Wait for final agent settlement before generating an away recap, including after retries, compaction, and queued continuations.
+
 ## [0.5.0] - 2026-08-14
 
 ### Changed
